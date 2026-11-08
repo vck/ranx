@@ -302,7 +302,7 @@ void llama_forward(llama_model *model, int token, int pos, float *logits) {
         // Attention scores
         attention_scores(scores, q,
                          model->kv_cache_k + (size_t)layer * cfg->n_kv_heads * cfg->max_seq_len * head_dim,
-                         cfg->n_kv_heads, n_head_per_kv, head_dim, n_pos);
+                         cfg->n_kv_heads, n_head_per_kv, head_dim, n_pos, cfg->max_seq_len);
 
         // Softmax over time dimension for each head
         for (int h = 0; h < cfg->n_heads; h++) {
@@ -312,7 +312,7 @@ void llama_forward(llama_model *model, int token, int pos, float *logits) {
         // Apply attention to values
         attention_apply(attn_out, scores,
                         model->kv_cache_v + (size_t)layer * cfg->n_kv_heads * cfg->max_seq_len * head_dim,
-                        cfg->n_kv_heads, n_head_per_kv, head_dim, n_pos);
+                        cfg->n_kv_heads, n_head_per_kv, head_dim, n_pos, cfg->max_seq_len);
 
         // Output projection
         memcpy(h, x, cfg->dim * sizeof(float)); // save residual

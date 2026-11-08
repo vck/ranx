@@ -1,0 +1,11 @@
+*.gguf
+ranx
+build/
+.DS_Store
+*.swp
+*.o
+node_modules/
+.venv/
+.openharness/
+__pycache__/
+*.pyc

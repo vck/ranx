@@ -10,12 +10,15 @@ void matmul_mv(float *y, const float *W, const float *x, int rows, int cols);
 
 // Matmul batch: C = A * B^T (for single-token attention scores)
 // scores[i] = sum_j q[j] * k[i][j]  / sqrt(head_dim)
+// kv_stride is the number of positions allocated per KV head (max_seq_len).
 void attention_scores(float *scores, const float *q, const float *K_cache,
-                       int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len);
+                       int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len,
+                       int kv_stride);
 
 // Apply attention scores to V cache to get output
 void attention_apply(float *output, const float *scores, const float *V_cache,
-                      int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len);
+                      int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len,
+                      int kv_stride);
 
 // RMSNorm: y = x / sqrt(mean(x^2) + eps) * w
 void rmsnorm(float *y, const float *x, const float *weight, int dim, float eps);

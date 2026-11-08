@@ -12,7 +12,8 @@ void matmul_mv(float *y, const float *W, const float *x, int rows, int cols) {
 }
 
 void attention_scores(float *scores, const float *q, const float *K_cache,
-                       int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len)
+                       int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len,
+                       int kv_stride)
 {
     int n_heads = n_kv_heads * n_heads_per_kv;
     float inv_scale = 1.0f / sqrtf((float)head_dim);
@@ -26,7 +27,7 @@ void attention_scores(float *scores, const float *q, const float *K_cache,
 
         // score against each cached position
         for (int t = 0; t < seq_len; t++) {
-            const float *kt = K_cache + (kv_head * seq_len + t) * head_dim;
+            const float *kt = K_cache + (kv_head * kv_stride + t) * head_dim;
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) {
                 dot += qh[d] * kt[d];
@@ -37,7 +38,8 @@ void attention_scores(float *scores, const float *q, const float *K_cache,
 }
 
 void attention_apply(float *output, const float *scores, const float *V_cache,
-                      int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len)
+                      int n_kv_heads, int n_heads_per_kv, int head_dim, int seq_len,
+                      int kv_stride)
 {
     int n_heads = n_kv_heads * n_heads_per_kv;
 
@@ -51,7 +53,7 @@ void attention_apply(float *output, const float *scores, const float *V_cache,
         memset(oh, 0, head_dim * sizeof(float));
 
         for (int t = 0; t < seq_len; t++) {
-            const float *vt = V_cache + (kv_head * seq_len + t) * head_dim;
+            const float *vt = V_cache + (kv_head * kv_stride + t) * head_dim;
             float score_t = sh[t];
             for (int d = 0; d < head_dim; d++) {
                 oh[d] += score_t * vt[d];
@@ -92,6 +94,8 @@ void softmax(float *x, int n) {
 }
 
 void apply_rope(float *q, int pos, int n_heads, int head_dim, float base_freq) {
+    // LLaMA "normal" RoPE (LLAMA_ROPE_TYPE_NORM): rotate consecutive pairs
+    // (d, d+1), with frequency base^(-d/head_dim).
     for (int h = 0; h < n_heads; h++) {
         float *head = q + h * head_dim;
         for (int d = 0; d < head_dim; d += 2) {

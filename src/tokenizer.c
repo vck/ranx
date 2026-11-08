@@ -55,7 +55,108 @@ static void build_prefix_lookup(tokenizer_t *tok) {
     }
 }
 
-// ─── Viterbi tokenizer ──────────────────────────────────────────────────────
+// ─── SentencePiece (SPM) tokenizer ──────────────────────────────────────────
+//
+// SentencePiece models are encoded by iteratively merging adjacent symbols.
+// Every adjacent pair whose concatenation exists in the vocabulary is a
+// candidate; the highest-scoring candidate is merged, then its new neighbours
+// become candidates.  This is the same algorithm llama.cpp uses for SPM
+// vocabularies.
+
+typedef struct {
+    const unsigned char *text;
+    int len;
+    int prev;
+    int next;
+} spm_symbol;
+
+typedef struct {
+    int   left;
+    int   right;
+    int   size;
+    float score;
+} spm_bigram;
+
+typedef struct {
+    spm_bigram *data;
+    int         size;
+    int         cap;
+} spm_heap;
+
+static bool bigram_better(const spm_bigram *a, const spm_bigram *b) {
+    if (a->score != b->score) return a->score > b->score;
+    return a->left < b->left;
+}
+
+static void heap_push(spm_heap *h, spm_bigram b) {
+    if (h->size == h->cap) {
+        h->cap = h->cap ? h->cap * 2 : 64;
+        h->data = realloc(h->data, h->cap * sizeof(spm_bigram));
+    }
+    int i = h->size++;
+    h->data[i] = b;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        if (!bigram_better(&h->data[i], &h->data[parent])) break;
+        spm_bigram tmp = h->data[i];
+        h->data[i] = h->data[parent];
+        h->data[parent] = tmp;
+        i = parent;
+    }
+}
+
+static spm_bigram heap_pop(spm_heap *h) {
+    spm_bigram top = h->data[0];
+    h->data[0] = h->data[--h->size];
+    int i = 0;
+    for (;;) {
+        int left = 2 * i + 1, right = left + 1, best = i;
+        if (left  < h->size && bigram_better(&h->data[left],  &h->data[best])) best = left;
+        if (right < h->size && bigram_better(&h->data[right], &h->data[best])) best = right;
+        if (best == i) break;
+        spm_bigram tmp = h->data[i];
+        h->data[i] = h->data[best];
+        h->data[best] = tmp;
+        i = best;
+    }
+    return top;
+}
+
+static int vocab_lookup(tokenizer_t *tok, const unsigned char *text, int len) {
+    if (len <= 0) return -1;
+    unsigned char first = text[0];
+    int *ids = tok->prefix_ids[first];
+    int count = tok->prefix_counts[first];
+    int found = -1;
+    for (int i = 0; i < count; i++) {
+        int tid = ids[i];
+        if (tok->token_lens[tid] == len &&
+            memcmp(tok->tokens[tid], text, (size_t)len) == 0) {
+            found = tid;
+        }
+    }
+    return found;
+}
+
+static void spm_try_add(tokenizer_t *tok, spm_symbol *syms, spm_heap *heap,
+                        int left, int right) {
+    if (left < 0 || right < 0) return;
+    int len = syms[left].len + syms[right].len;
+    int tid = vocab_lookup(tok, syms[left].text, len);
+    if (tid < 0) return;
+
+    spm_bigram b;
+    b.left  = left;
+    b.right = right;
+    b.size  = len;
+    b.score = tok->scores ? tok->scores[tid] : 0.0f;
+    heap_push(heap, b);
+}
+
+static int utf8_char_len(unsigned char c) {
+    static const int lookup[16] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
+    return lookup[c >> 4];
+}
 
 int *tokenizer_encode(tokenizer_t *tok, const char *text, int *out_len) {
     unsigned char norm[16384];
@@ -73,93 +174,66 @@ int *tokenizer_encode(tokenizer_t *tok, const char *text, int *out_len) {
         p++;
     }
 
-    // Viterbi: vocab tokens only. Byte-fallback fills gaps after.
-    float *best_score = malloc((norm_len + 1) * sizeof(float));
-    int   *best_tok   = malloc((norm_len + 1) * sizeof(int));
-    int   *best_len   = malloc((norm_len + 1) * sizeof(int));
-
-    for (int i = 0; i <= norm_len; i++) {
-        best_score[i] = -1e30f;
-        best_tok[i] = -1;
-        best_len[i] = 0;
-    }
-    best_score[0] = 0.0f;
-
-    for (int pos = 0; pos < norm_len; pos++) {
-        if (best_score[pos] < -1e20f) continue;
-
-        unsigned char first = norm[pos];
-        int count = tok->prefix_counts[first];
-        int *p_ids = tok->prefix_ids[first];
-
-        for (int i = 0; i < count; i++) {
-            int tid = p_ids[i];
-            int tlen = tok->token_lens[tid];
-            if (pos + tlen > norm_len) continue;
-            if (memcmp(norm + pos, tok->tokens[tid], tlen) != 0) continue;
-
-            // Skip byte-fallback tokens — they're a last resort
-            if (tok->has_byte_fallback && tid >= 0 && tid < 256 &&
-                tok->byte_fallback[tid] == tid) continue;
-            unsigned char *t = (unsigned char *)tok->tokens[tid];
-            if (tlen == 6 && t[0] == '<' && t[1] == '0' && t[2] == 'x' &&
-                is_hex(t[3]) && is_hex(t[4]) && t[5] == '>') continue;
-
-            int npos = pos + tlen;
-            float score = (tok->scores && tid < tok->n_tokens) ? tok->scores[tid] : -5.0f;
-            // Length bonus: longer tokens strongly preferred
-            score += (float)tlen * 0.5f;
-            float cand = best_score[pos] + score;
-            if (cand > best_score[npos]) {
-                best_score[npos] = cand;
-                best_tok[npos]   = tid;
-                best_len[npos]   = tlen;
-            }
-        }
+    // Split the normalized text into UTF-8 characters (symbols).
+    spm_symbol *syms = malloc((norm_len + 1) * sizeof(spm_symbol));
+    int n_syms = 0;
+    int offs = 0;
+    while (offs < norm_len) {
+        int char_len = utf8_char_len(norm[offs]);
+        if (char_len > norm_len - offs) char_len = norm_len - offs;
+        syms[n_syms].text = norm + offs;
+        syms[n_syms].len  = char_len;
+        syms[n_syms].prev = n_syms - 1;
+        syms[n_syms].next = (offs + char_len == norm_len) ? -1 : n_syms + 1;
+        offs += char_len;
+        n_syms++;
     }
 
-    // Build output forward, using Viterbi result where available
-    // Fill unreachable positions with byte-fallback
-    int *ids = malloc(1024 * sizeof(int));
-    int n_ids = 0;
-    int cap = 1024;
+    // Seed the work queue with every adjacent pair that forms a token.
+    spm_heap heap = {0};
+    for (int i = 1; i < n_syms; i++) spm_try_add(tok, syms, &heap, i - 1, i);
 
-    int cur = 0;
-    while (cur < norm_len) {
-        // Look ahead for the best token starting at cur
-        int best_id = -1;
-        int best_span = 1; // default advance
-        unsigned char first = norm[cur];
+    // Repeatedly merge the highest-scoring pair.
+    while (heap.size > 0) {
+        spm_bigram bigram = heap_pop(&heap);
+        spm_symbol *left  = &syms[bigram.left];
+        spm_symbol *right = &syms[bigram.right];
 
-        // Check if Viterbi found a token at position cur+span that originates at cur
-        for (int span = 1; span <= norm_len - cur; span++) {
-            if (best_tok[cur + span] >= 0 && best_len[cur + span] == span) {
-                best_id = best_tok[cur + span];
-                best_span = span;
-                break;
-            }
-        }
+        if (left->len == 0 || right->len == 0 ||
+            left->len + right->len != bigram.size) continue;
 
-        if (best_id >= 0) {
+        left->len += right->len;
+        right->len = 0;
+
+        left->next = right->next;
+        if (right->next >= 0) syms[right->next].prev = bigram.left;
+
+        spm_try_add(tok, syms, &heap, left->prev, bigram.left);
+        spm_try_add(tok, syms, &heap, bigram.left, left->next);
+    }
+
+    // Emit tokens for the surviving symbols, falling back to bytes.
+    int cap = 64, n_ids = 0;
+    int *ids = malloc(cap * sizeof(int));
+    for (int i = 0; i != -1; i = syms[i].next) {
+        int tid = vocab_lookup(tok, syms[i].text, syms[i].len);
+        if (tid >= 0) {
             if (n_ids >= cap) { cap *= 2; ids = realloc(ids, cap * sizeof(int)); }
-            ids[n_ids++] = best_id;
-            cur += best_span;
-        } else {
-            // No vocab match from cur — use byte-fallback for 1 byte
-            if (tok->has_byte_fallback && tok->byte_fallback[first] >= 0) {
-                if (n_ids >= cap) { cap *= 2; ids = realloc(ids, cap * sizeof(int)); }
-                ids[n_ids++] = tok->byte_fallback[first];
-            }
-            cur++;
+            ids[n_ids++] = tid;
+            continue;
+        }
+        for (int j = 0; j < syms[i].len; j++) {
+            unsigned char byte = syms[i].text[j];
+            int bf = tok->has_byte_fallback ? tok->byte_fallback[byte] : -1;
+            if (n_ids >= cap) { cap *= 2; ids = realloc(ids, cap * sizeof(int)); }
+            ids[n_ids++] = bf >= 0 ? bf : tok->unk_id;
         }
     }
+
+    free(syms);
+    free(heap.data);
 
     *out_len = n_ids;
-
-    free(best_score);
-    free(best_tok);
-    free(best_len);
-
     return ids;
 }
 
